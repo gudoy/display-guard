@@ -21,8 +21,10 @@ if [ "${1:-}" = "--remove" ]; then
     exit 0
 fi
 
-mkdir -p "$APP/Contents/MacOS" "$HOME/Library/LaunchAgents"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$HOME/Library/LaunchAgents"
 swiftc -O -o "$BIN" "$HERE/DisplayGuard.swift"
+# AppIcon.icns is generated from AppIcon.svg and committed, so building needs no extra tool.
+cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +34,7 @@ cat > "$APP/Contents/Info.plist" <<EOF
     <key>CFBundleName</key><string>Display Guard</string>
     <key>CFBundleIdentifier</key><string>$LABEL</string>
     <key>CFBundleExecutable</key><string>DisplayGuard</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>1.0</string>
     <key>LSUIElement</key><true/>

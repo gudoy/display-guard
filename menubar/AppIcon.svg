@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#fbfcfd"/>
+      <stop offset="1" stop-color="#d3d9e2"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#5aa0ff"/>
+      <stop offset=".5" stop-color="#9cc6ff"/>
+      <stop offset="1" stop-color="#5aa0ff"/>
+    </linearGradient>
+  </defs>
+  <!-- Display Guard: two curved Odyssey G9 panels, stacked as on the desk -->
+  <rect x="8" y="8" width="84" height="84" rx="19" fill="url(#bg)" stroke="#c5ccd6" stroke-width=".8"/>
+  <path d="M44 63 h12 l2 7 h-16 z" fill="#6b7384"/>
+  <path d="M18 30 Q50 22 82 30 L82 46 Q50 38 18 46 Z" fill="url(#screen)" stroke="#5b6475" stroke-width="1.2" stroke-linejoin="round"/>
+  <path d="M18 50 Q50 42 82 50 L82 66 Q50 58 18 66 Z" fill="url(#screen)" fill-opacity=".85" stroke="#5b6475" stroke-width="1.2" stroke-linejoin="round"/>
+</svg>
