@@ -10,25 +10,31 @@ Samsung Odyssey G93SC panels.
    A **Pro licence is required** — resolution protection is a Pro feature.
    Check your licence terms for whether it covers a second machine; buy a
    second seat if it does not.
-2. Install the Swift compiler if missing: `xcode-select --install`.
-3. Connect both panels over **DisplayPort** (USB-C to DP is fine) and arrange
+2. Connect both panels over **DisplayPort** (USB-C to DP is fine) and arrange
    them in System Settings > Displays the way you want them.
-4. Run:
+3. Download `DisplayGuard-<version>.dmg` from the
+   [Releases page](https://github.com/gudoy/display-guard/releases), open it and
+   drag **Display Guard** into Applications.
+4. Open Display Guard. The app is not signed with an Apple Developer ID, so the
+   first time macOS refuses to open it: go to System Settings > Privacy & Security
+   and click **Open Anyway**. This is needed only once.
+5. Click **Configurer** in the welcome dialog.
 
-   ```bash
-   git clone git@github.com:gudoy/display-guard.git ~/display-setup
-   ~/display-setup/install.sh
-   ```
-
-`install.sh` applies the BetterDisplay settings, saves the current arrangement
-to `layout.conf` (machine-local, not committed), installs the reconciler agent
-and the **Display Guard** menu bar app. Re-run it any time; it is idempotent.
+On first launch the app copies its scripts to
+`~/Library/Application Support/Display Guard`, applies the BetterDisplay
+settings, saves the current arrangement to `layout.conf` there, installs the
+reconciler agent and starts itself at every login. Installing a newer version
+over it updates the scripts on the next launch and keeps the arrangement.
 
 The panels are identified by their alphanumeric serial. On a fresh machine every
-connected `Odyssey G93SC` is taken; after that, `layout.conf` is the list. Delete
-`layout.conf` and re-run `install.sh` after replacing a panel.
+connected `Odyssey G93SC` is taken; after that, `layout.conf` is the list. After
+replacing a panel, delete `layout.conf` and choose **Configurer les écrans…** in
+the menu.
 
-Uninstall: `./menubar/build.sh --remove` and `./install-agent.sh --remove`.
+Uninstall: **Désinstaller Display Guard…** in the menu.
+
+From source (needs `xcode-select --install`): clone the repo and run
+`./install.sh`. `menubar/build.sh --dmg` builds the release image.
 
 ## Display Guard (menu bar)
 
@@ -44,15 +50,15 @@ the panels flicker on 2026-10-31.
 itself, writes the reason to `paused` and sends a notification. "Reprendre" in
 the menu resumes and resets the count.
 
-## Hands-off mode (recommended)
+## The reconciler
+
+The app installs it for you. By hand, from `~/Library/Application Support/Display Guard`:
 
 ```bash
-./install-agent.sh            # install and start the reconciler
 ./install-agent.sh --status   # is it running, and what has it fixed lately
-./install-agent.sh --remove   # stop and uninstall
 ```
 
-This installs a LaunchAgent that runs `reconcile.sh` at login and every 15s. It puts both
+It is a LaunchAgent that runs `reconcile.sh` at login and every 15s. It puts both
 panels back to 5120x1440 (one at 240Hz, the other at 120Hz) and restores their positions,
 with no interaction at all. A pass that finds nothing wrong costs ~1.2s and writes
 nothing; only a genuine repair does work, and it logs to `reconcile.log`.

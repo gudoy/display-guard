@@ -5,3 +5,4 @@ reconcile.log
 reconcile.log.tmp
 reconcile.err
 .DS_Store
+build/
