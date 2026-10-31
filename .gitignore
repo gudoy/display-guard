@@ -1,0 +1,7 @@
+# Machine-local state: each Mac has its own panels and arrangement.
+layout.conf
+paused
+reconcile.log
+reconcile.log.tmp
+reconcile.err
+.DS_Store
