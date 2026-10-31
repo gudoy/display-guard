@@ -13,7 +13,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(dirname "$HERE")"
-VERSION="1.1"
+VERSION="1.2"
 OUT="$ROOT/build"
 APP="$OUT/Display Guard.app"
 ID="com.diginja.displays.menubar"
@@ -22,16 +22,13 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 for arch in arm64 x86_64; do
-    swiftc -O -target "$arch-apple-macos13.0" -o "$OUT/DisplayGuard-$arch" "$HERE/DisplayGuard.swift"
+    swiftc -O -target "$arch-apple-macos13.0" -o "$OUT/DisplayGuard-$arch" "$HERE"/*.swift
 done
 lipo -create -output "$APP/Contents/MacOS/DisplayGuard" "$OUT"/DisplayGuard-arm64 "$OUT"/DisplayGuard-x86_64
 rm -f "$OUT"/DisplayGuard-arm64 "$OUT"/DisplayGuard-x86_64
 
 # AppIcon.icns is generated from AppIcon.svg and committed, so building needs no extra tool.
 cp "$HERE/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-for s in reconcile.sh odyssey-setup.sh install-agent.sh; do
-    cp "$ROOT/$s" "$APP/Contents/Resources/$s"
-done
 
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

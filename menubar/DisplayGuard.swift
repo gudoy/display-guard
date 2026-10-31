@@ -1,85 +1,22 @@
-// Display Guard — menu bar front-end for reconcile.sh, and its own installer.
+// DisplayGuard.swift — the menu bar app, and its own installer.
 //
-// The app never touches the displays itself. It only edits the reconciler's inputs
-// (layout.conf, the "paused" flag file) and can trigger one run. reconcile.sh, run every
-// 15s by the com.diginja.displays.reconcile LaunchAgent, stays the single enforcer —
-// two enforcers with different rules is exactly what made the panels flicker before.
+// The app never fights the reconciler: it only edits its inputs (layout.conf, the
+// "paused" flag file) and can trigger one run. `DisplayGuard --reconcile`, run every 15s
+// by the com.diginja.displays.reconcile LaunchAgent, stays the single enforcer — two
+// enforcers with different rules is exactly what made the panels flicker before.
 //
-// Self-install: the scripts ship inside the app bundle. On every launch the app copies
-// them to ~/Library/Application Support/Display Guard (so an updated app updates them),
-// makes sure both LaunchAgents point at the right place, and on the very first launch
-// walks the user through saving the screen arrangement.
+// On every launch the app makes sure both LaunchAgents point at its current location,
+// and on the very first launch it saves the screen arrangement.
 
 import AppKit
-
-let fm = FileManager.default
-let home = fm.homeDirectoryForCurrentUser
-let dir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-    .appendingPathComponent("Display Guard")
-let legacyDir = home.appendingPathComponent("display-setup")   // before the app shipped its scripts
-let layoutURL = dir.appendingPathComponent("layout.conf")
-let pauseURL = dir.appendingPathComponent("paused")
-let logURL = dir.appendingPathComponent("reconcile.log")
-let bundledScripts = ["reconcile.sh", "odyssey-setup.sh", "install-agent.sh"]
-func script(_ name: String) -> String { dir.appendingPathComponent(name).path }
-
-let agentLabel = "com.diginja.displays.reconcile"
-let menubarLabel = "com.diginja.displays.menubar"
-let launchAgents = home.appendingPathComponent("Library/LaunchAgents")
-let agentPlist = launchAgents.appendingPathComponent("\(agentLabel).plist")
-let menubarPlist = launchAgents.appendingPathComponent("\(menubarLabel).plist")
-let betterDisplay = "/Applications/BetterDisplay.app"
-let topPos = "0x0", bottomPos = "0x1440"
-
-/// Runs a command to completion; returns its exit status and combined output.
-@discardableResult
-func run(_ path: String, _ args: [String], env: [String: String] = [:]) -> (status: Int32, output: String) {
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: path)
-    p.arguments = args
-    p.environment = ProcessInfo.processInfo.environment.merging(env) { $1 }
-    let pipe = Pipe()
-    p.standardOutput = pipe
-    p.standardError = pipe
-    do { try p.run() } catch { return (-1, error.localizedDescription) }
-    let data = pipe.fileHandleForReading.readDataToEndOfFile()
-    p.waitUntilExit()
-    return (p.terminationStatus, String(decoding: data, as: UTF8.self))
-}
-
-/// layout.conf: one "SERIAL=XxY" line per panel, plus an optional "PRIMARY=SERIAL".
-struct Config {
-    var positions: [(serial: String, pos: String)] = []
-    var primary = "auto"
-
-    static func load() -> Config {
-        var c = Config()
-        guard let text = try? String(contentsOf: layoutURL, encoding: .utf8) else { return c }
-        for line in text.split(separator: "\n") {
-            let kv = line.split(separator: "=", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespaces) }
-            guard kv.count == 2, !kv[0].isEmpty else { continue }
-            if kv[0] == "PRIMARY" { c.primary = kv[1] } else { c.positions.append((kv[0], kv[1])) }
-        }
-        return c
-    }
-
-    func save() throws {
-        var lines = positions.map { "\($0.serial)=\($0.pos)" }
-        if primary != "auto" { lines.append("PRIMARY=\(primary)") }
-        try (lines.joined(separator: "\n") + "\n").write(to: layoutURL, atomically: true, encoding: .utf8)
-    }
-
-    var serials: [String] { positions.map(\.serial) }
-    var top: String? { positions.first { $0.pos == topPos }?.serial }
-}
-
-enum State { case unconfigured, active, paused, stopped }
 
 final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
     let menu = NSMenu()
+    let overlay = IdentifyOverlay()
     var timer: Timer?
-    var busy: String?          // shown in the menu while a long setup step runs
+
+    enum State { case unsupported, unconfigured, active, paused, stopped }
 
     func applicationDidFinishLaunching(_ n: Notification) {
         // One instance only: an install over an older copy can briefly start a second one.
@@ -95,12 +32,14 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         do {
             try installFiles()
         } catch {
-            alert("Display Guard n'a pas pu s'installer", error.localizedDescription)
+            alert(t("error.install"), error.localizedDescription)
         }
         refreshIcon()
         timer = Timer.scheduledTimer(withTimeInterval: 10, repeats: true) { [weak self] _ in self?.refreshIcon() }
 
-        if fm.fileExists(atPath: layoutURL.path) {
+        if !Displays.available {
+            alert(t("unsupported.title"), t("unsupported.text"))
+        } else if fm.fileExists(atPath: layoutURL.path) {
             ensureReconcileAgent()
         } else {
             DispatchQueue.main.async { self.firstRun() }
@@ -109,23 +48,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // MARK: install
 
-    /// Scripts from the bundle, migration from ~/display-setup, and the login agent.
     func installFiles() throws {
         try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        for name in bundledScripts {
-            guard let src = Bundle.main.url(forResource: name, withExtension: nil) else {
-                throw NSError(domain: "DisplayGuard", code: 1,
-                              userInfo: [NSLocalizedDescriptionKey: "\(name) manque dans l'app. Réinstalle-la."])
-            }
-            let dst = dir.appendingPathComponent(name)
-            let data = try Data(contentsOf: src)
-            if (try? Data(contentsOf: dst)) != data {
-                try data.write(to: dst, options: .atomic)
-            }
-            try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: dst.path)
-        }
 
-        // Keep the arrangement and history of a setup made before the app shipped its scripts.
+        // Keep the arrangement and history of a setup made before the app existed.
         if !fm.fileExists(atPath: layoutURL.path) {
             for name in ["layout.conf", "reconcile.log"] {
                 let old = legacyDir.appendingPathComponent(name)
@@ -135,99 +61,110 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }
             }
         }
+        // Up to 1.1 the reconciler was a set of bash scripts driving BetterDisplay.
+        for old in ["reconcile.sh", "odyssey-setup.sh", "install-agent.sh"] {
+            try? fm.removeItem(at: dir.appendingPathComponent(old))
+        }
 
         // Start at login. Written on every launch so a moved app keeps working.
         guard let exe = Bundle.main.executablePath else { return }
-        let plist = """
+        try writeIfChanged(menubarPlist, plist(label: menubarLabel, args: [exe], extra: """
+                <key>ProcessType</key><string>Interactive</string>
+            """))
+    }
+
+    func plist(label: String, args: [String], extra: String) -> String {
+        let argv = args.map { "        <string>\($0)</string>" }.joined(separator: "\n")
+        return """
         <?xml version="1.0" encoding="UTF-8"?>
         <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
         <plist version="1.0">
         <dict>
-            <key>Label</key><string>\(menubarLabel)</string>
-            <key>Program</key><string>\(exe)</string>
+            <key>Label</key><string>\(label)</string>
+            <key>ProgramArguments</key>
+            <array>
+        \(argv)
+            </array>
             <key>RunAtLoad</key><true/>
-            <key>ProcessType</key><string>Interactive</string>
+            <key>LimitLoadToSessionType</key><string>Aqua</string>
+        \(extra)
         </dict>
         </plist>
 
         """
-        try fm.createDirectory(at: launchAgents, withIntermediateDirectories: true)
-        if (try? String(contentsOf: menubarPlist, encoding: .utf8)) != plist {
-            try plist.write(to: menubarPlist, atomically: true, encoding: .utf8)
-        }
     }
 
-    /// (Re)installs the reconciler agent when it is missing or points at another folder.
-    func ensureReconcileAgent() {
-        let current = (try? String(contentsOf: agentPlist, encoding: .utf8)) ?? ""
-        let loaded = run("/bin/launchctl", ["print", "gui/\(getuid())/\(agentLabel)"]).status == 0
-        guard !current.contains(script("reconcile.sh")) || !loaded else { return }
-        DispatchQueue.global().async {
-            run("/bin/bash", [script("install-agent.sh")])
-            DispatchQueue.main.async { self.refreshIcon() }
+    /// Returns true when the file content changed.
+    @discardableResult
+    func writeIfChanged(_ url: URL, _ content: String) throws -> Bool {
+        try fm.createDirectory(at: launchAgents, withIntermediateDirectories: true)
+        guard (try? String(contentsOf: url, encoding: .utf8)) != content else { return false }
+        try content.write(to: url, atomically: true, encoding: .utf8)
+        return true
+    }
+
+    /// (Re)loads the reconciler agent when its plist changed or it is not running.
+    func ensureReconcileAgent(reload: Bool = false) {
+        guard let exe = Bundle.main.executablePath else { return }
+        let content = plist(label: agentLabel, args: [exe, "--reconcile"], extra: """
+                <key>StartInterval</key><integer>15</integer>
+                <key>ProcessType</key><string>Background</string>
+                <key>LowPriorityIO</key><true/>
+                <key>StandardErrorPath</key><string>\(dir.appendingPathComponent("reconcile.err").path)</string>
+            """)
+        let changed = (try? writeIfChanged(agentPlist, content)) ?? false
+        let domain = "gui/\(getuid())"
+        let loaded = run("/bin/launchctl", ["print", "\(domain)/\(agentLabel)"]).status == 0
+        if changed || !loaded || reload {
+            run("/bin/launchctl", ["bootout", "\(domain)/\(agentLabel)"])
+            run("/bin/launchctl", ["bootstrap", domain, agentPlist.path])
         }
+        refreshIcon()
     }
 
     func firstRun() {
-        guard fm.fileExists(atPath: betterDisplay) else {
-            NSApp.activate(ignoringOtherApps: true)
-            let a = NSAlert()
-            a.messageText = "BetterDisplay est nécessaire"
-            a.informativeText = "Display Guard pilote les écrans via BetterDisplay (licence Pro). Installe-le dans Applications, lance-le une fois, puis choisis « Configurer les écrans… » dans le menu de Display Guard."
-            a.addButton(withTitle: "Ouvrir betterdisplay.pro")
-            a.addButton(withTitle: "Plus tard")
-            if a.runModal() == .alertFirstButtonReturn {
-                NSWorkspace.shared.open(URL(string: "https://betterdisplay.pro")!)
-            }
-            return
-        }
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
-        a.messageText = "Configurer les écrans"
-        a.informativeText = """
-        1. Branche les deux écrans en DisplayPort.
-        2. Dispose-les dans Réglages Système > Moniteurs comme tu les veux.
-        3. Clique sur Configurer.
-
-        Display Guard applique les réglages BetterDisplay, enregistre cette disposition, puis la rétablit toutes les 15 s. Les écrans peuvent clignoter une fois pendant la configuration.
-        """
-        a.addButton(withTitle: "Configurer")
-        a.addButton(withTitle: "Plus tard")
+        a.messageText = t("welcome.title")
+        a.informativeText = t("welcome.text")
+        a.addButton(withTitle: t("button.setup"))
+        a.addButton(withTitle: t("button.later"))
         guard a.runModal() == .alertFirstButtonReturn else { return }
         configure()
     }
 
-    @objc func configure() {
-        busy = "Configuration des écrans…"
-        refreshIcon()
-        DispatchQueue.global().async {
-            var log = ""
-            let setup = run("/bin/bash", [script("odyssey-setup.sh")])
-            log += setup.output
-            var ok = setup.status == 0
-            if ok && !fm.fileExists(atPath: layoutURL.path) {
-                let save = run("/bin/bash", [script("odyssey-setup.sh"), "--save-layout"])
-                log += save.output
-                ok = save.status == 0 && fm.fileExists(atPath: layoutURL.path)
-            }
-            if ok { log += run("/bin/bash", [script("install-agent.sh")]).output }
-            DispatchQueue.main.async {
-                self.busy = nil
-                self.refreshIcon()
-                if ok {
-                    let layout = Config.load().positions.map { "\($0.serial) en \($0.pos == topPos ? "haut" : "bas")" }
-                    self.alert("Écrans configurés", "Disposition enregistrée : \(layout.joined(separator: ", ")).\nDisplay Guard la rétablit maintenant toutes les 15 s.")
-                } else {
-                    let tail = log.split(separator: "\n").suffix(8).joined(separator: "\n")
-                    self.alert("La configuration a échoué", "Vérifie que les deux écrans sont branchés et que BetterDisplay tourne, puis réessaie avec « Configurer les écrans… ».\n\n\(tail)")
-                }
-            }
+    /// Saves the current macOS arrangement of every 5120x1440 panel as the one to enforce.
+    func configure() {
+        let panels = Displays.active().filter {
+            $0.mode(Reconciler.width, Reconciler.height, Reconciler.lo) != nil
+                || $0.mode(Reconciler.width, Reconciler.height, Reconciler.hi) != nil
         }
+        guard !panels.isEmpty else {
+            alert(t("noscreen.title"), t("noscreen.text"))
+            return
+        }
+        var cfg = Config()
+        cfg.positions = panels
+            .sorted { ($0.origin.y, $0.origin.x) < ($1.origin.y, $1.origin.x) }
+            .map { ($0.serial, $0.origin.text) }
+        do {
+            try cfg.save()
+        } catch {
+            alert(t("error.save"), error.localizedDescription)
+            return
+        }
+        ensureReconcileAgent()
+        repairNow()
+        let summary = cfg.positions.map {
+            Config.parse($0.pos)?.y == 0 ? t("done.top", $0.serial) : t("done.bottom", $0.serial)
+        }
+        alert(t("done.title"), t("done.text", summary.joined(separator: ", ")))
     }
 
     // MARK: state
 
     var state: State {
+        if !Displays.available { return .unsupported }
         if !fm.fileExists(atPath: layoutURL.path) { return .unconfigured }
         if fm.fileExists(atPath: pauseURL.path) { return .paused }
         return run("/bin/launchctl", ["print", "gui/\(getuid())/\(agentLabel)"]).status == 0 ? .active : .stopped
@@ -237,14 +174,8 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func recentLog() -> (last: String?, recentCount: Int) {
         guard let text = try? String(contentsOf: logURL, encoding: .utf8) else { return (nil, 0) }
         let lines = text.split(separator: "\n").map(String.init)
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        let cutoff = Date().addingTimeInterval(-300)
-        let recent = lines.suffix(200).filter { line in
-            guard let d = fmt.date(from: String(line.prefix(19))) else { return false }
-            return d > cutoff
-        }
-        return (lines.last, recent.count)
+        let since = stamp.string(from: Date().addingTimeInterval(-300))
+        return (lines.last, lines.suffix(200).filter { String($0.prefix(19)) >= since }.count)
     }
 
     func refreshIcon() {
@@ -252,13 +183,13 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let symbol: String
         let tip: String
         switch state {
-        case _ where busy != nil: symbol = "hourglass"; tip = busy!
-        case .unconfigured: symbol = "exclamationmark.triangle"; tip = "Display Guard : écrans pas encore configurés"
-        case .paused:  symbol = "pause.rectangle";  tip = "Display Guard : en pause"
-        case .stopped: symbol = "exclamationmark.triangle"; tip = "Display Guard : agent arrêté"
+        case .unsupported, .unconfigured:
+            symbol = "exclamationmark.triangle"; tip = t("tip.unconfigured")
+        case .paused:  symbol = "pause.rectangle"; tip = t("tip.paused")
+        case .stopped: symbol = "exclamationmark.triangle"; tip = t("tip.stopped")
         case .active where recent >= 6:
-            symbol = "display.trianglebadge.exclamationmark"; tip = "Display Guard : corrections répétées"
-        case .active:  symbol = "display.2"; tip = "Display Guard : actif"
+            symbol = "display.trianglebadge.exclamationmark"; tip = t("tip.loop")
+        case .active:  symbol = "display.2"; tip = t("tip.active")
         }
         item.button?.image = NSImage(systemSymbolName: symbol, accessibilityDescription: tip)
         item.button?.image?.isTemplate = true
@@ -269,75 +200,73 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
-        if let busy {
-            menu.addItem(info(busy))
-            return
-        }
         let st = state
-        if st == .unconfigured {
-            menu.addItem(info("! Écrans pas encore configurés"))
-            menu.addItem(.separator())
-            menu.addItem(action("Configurer les écrans…", #selector(startFirstRun)))
-            menu.addItem(.separator())
-            menu.addItem(action("Désinstaller Display Guard…", #selector(uninstall)))
-            menu.addItem(action("Quitter Display Guard", #selector(quit)))
+        switch st {
+        case .unsupported:
+            menu.addItem(info(t("status.unsupported")))
+            footer(menu)
             return
+        case .unconfigured:
+            menu.addItem(info(t("status.unconfigured")))
+            menu.addItem(.separator())
+            menu.addItem(action(t("menu.configure"), #selector(startFirstRun)))
+            menu.addItem(action(t("menu.identify"), #selector(identify)))
+            footer(menu)
+            return
+        default: break
         }
 
         let cfg = Config.load()
+        let displays = Displays.active()
         let (last, recent) = recentLog()
-        let status: String
+
         switch st {
-        case .active:  status = "● Actif — vérifie toutes les 15 s"
-        case .paused:  status = "◌ En pause — les écrans ne sont plus corrigés"
-        default:       status = "! Agent arrêté"
+        case .active: menu.addItem(info(t("status.active")))
+        case .paused: menu.addItem(info(t("status.paused")))
+        default:      menu.addItem(info(t("status.stopped")))
         }
-        menu.addItem(info(status))
-        if st == .paused,
-           let reason = try? String(contentsOf: pauseURL, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines), !reason.isEmpty {
-            menu.addItem(info("⚠︎ " + reason))
+        if st == .paused, let reason = try? String(contentsOf: pauseURL, encoding: .utf8),
+           reason.hasPrefix("breaker:"), let n = Int(reason.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)) {
+            menu.addItem(info(t("status.breaker", n)))
         }
-        if let last { menu.addItem(info("Dernière action : " + String(last.dropFirst(11)))) }
-        if recent >= 6 { menu.addItem(info("⚠︎ \(recent) corrections en 5 min : un autre outil se bat ?")) }
+        if let last { menu.addItem(info(t("status.last", String(last.dropFirst(11))))) }
+        if recent >= 6 { menu.addItem(info(t("status.loop", recent))) }
         menu.addItem(.separator())
 
         switch st {
-        case .active:  menu.addItem(action("Mettre en pause", #selector(pause)))
-        case .paused:  menu.addItem(action("Reprendre", #selector(resume)))
-        default:       menu.addItem(action("Démarrer l'agent", #selector(startAgent)))
+        case .active: menu.addItem(action(t("menu.pause"), #selector(pause)))
+        case .paused: menu.addItem(action(t("menu.resume"), #selector(resume)))
+        default:      menu.addItem(action(t("menu.start"), #selector(startAgent)))
         }
-        menu.addItem(action("Réparer maintenant", #selector(repairNow)))
+        menu.addItem(action(t("menu.repair"), #selector(repairNow)))
+        menu.addItem(action(t("menu.identify"), #selector(identify)))
         menu.addItem(.separator())
 
-        let top = NSMenuItem(title: "Écran du haut", action: nil, keyEquivalent: "")
-        let topMenu = NSMenu()
-        for s in cfg.serials {
-            let i = action(s, #selector(setTop(_:)))
-            i.representedObject = s
-            i.state = cfg.top == s ? .on : .off
-            topMenu.addItem(i)
+        // "HNTX104094 · 120 Hz", so the serials in the submenus mean something.
+        func label(_ serial: String) -> String {
+            guard let d = displays.first(where: { $0.serial == serial }) else { return t("menu.serialOff", serial) }
+            return d.current.map { "\(serial) · \($0.hz) Hz" } ?? serial
         }
-        top.submenu = topMenu
-        menu.addItem(top)
+        menu.addItem(submenu(t("menu.top"), cfg.serials.map { s in
+            choice(label(s), s, cfg.top == s, #selector(setTop(_:)))
+        }))
+        var hz = [choice(t("menu.auto"), "auto", cfg.primary == "auto", #selector(setPrimary(_:)))]
+        hz += cfg.serials.map { s in choice(label(s), s, cfg.primary == s, #selector(setPrimary(_:))) }
+        hz += [.separator(), info(t("menu.hzNote"))]
+        menu.addItem(submenu(t("menu.hz"), hz))
+        footer(menu)
+    }
 
-        let hz = NSMenuItem(title: "Écran à 240 Hz", action: nil, keyEquivalent: "")
-        let hzMenu = NSMenu()
-        for s in ["auto"] + cfg.serials {
-            let i = action(s == "auto" ? "Automatique" : s, #selector(setPrimary(_:)))
-            i.representedObject = s
-            i.state = cfg.primary == s ? .on : .off
-            hzMenu.addItem(i)
-        }
-        hzMenu.addItem(.separator())
-        hzMenu.addItem(info("Seul l'écran branché sur le port rapide peut avoir 240 Hz"))
-        hz.submenu = hzMenu
-        menu.addItem(hz)
-
+    /// Language, log, uninstall and quit: present in every state.
+    func footer(_ menu: NSMenu) {
         menu.addItem(.separator())
-        menu.addItem(action("Ouvrir le journal", #selector(openLog)))
-        menu.addItem(action("Désinstaller Display Guard…", #selector(uninstall)))
-        menu.addItem(action("Quitter Display Guard", #selector(quit)))
+        let names: [Language: String] = [.auto: t("menu.langAuto"), .en: "English", .fr: "Français"]
+        menu.addItem(submenu(t("menu.language"), Language.allCases.map { l in
+            choice(names[l]!, l.rawValue, Language.setting == l, #selector(setLanguage(_:)))
+        }))
+        menu.addItem(action(t("menu.log"), #selector(openLog)))
+        menu.addItem(action(t("menu.uninstall"), #selector(uninstall)))
+        menu.addItem(action(t("menu.quit"), #selector(quit)))
     }
 
     func info(_ title: String) -> NSMenuItem {
@@ -352,6 +281,21 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return i
     }
 
+    func choice(_ title: String, _ value: String, _ on: Bool, _ sel: Selector) -> NSMenuItem {
+        let i = action(title, sel)
+        i.representedObject = value
+        i.state = on ? .on : .off
+        return i
+    }
+
+    func submenu(_ title: String, _ items: [NSMenuItem]) -> NSMenuItem {
+        let i = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let m = NSMenu()
+        items.forEach(m.addItem)
+        i.submenu = m
+        return i
+    }
+
     func alert(_ title: String, _ text: String) {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
@@ -363,6 +307,7 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: actions
 
     @objc func startFirstRun() { firstRun() }
+    @objc func identify() { overlay.show() }
 
     @objc func pause() {
         fm.createFile(atPath: pauseURL.path, contents: nil)
@@ -371,28 +316,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func resume() {
         try? fm.removeItem(at: pauseURL)
-        // Restarts reconcile.sh's circuit-breaker count, otherwise it would trip again at once.
-        let fmt = DateFormatter()
-        fmt.dateFormat = "yyyy-MM-dd HH:mm:ss"
-        if let h = try? FileHandle(forWritingTo: logURL) {
-            h.seekToEndOfFile()
-            h.write("\(fmt.string(from: Date()))  RESUMED (menu)\n".data(using: .utf8)!)
-            try? h.close()
-        }
+        appendLog("RESUMED (menu)")   // restarts the circuit-breaker count
         refreshIcon()
         repairNow()
     }
 
-    @objc func startAgent() {
-        DispatchQueue.global().async {
-            run("/bin/bash", [script("install-agent.sh")])
-            DispatchQueue.main.async { self.refreshIcon() }
-        }
-    }
+    @objc func startAgent() { ensureReconcileAgent(reload: true) }
 
+    /// One forced pass in a separate process, sharing the reconciler's lock.
     @objc func repairNow() {
+        guard let exe = Bundle.main.executablePath else { return }
         DispatchQueue.global().async {
-            run("/bin/bash", [script("reconcile.sh")], env: ["RECONCILE_FORCE": "1"])
+            run(exe, ["--reconcile", "--force"])
             DispatchQueue.main.async { self.refreshIcon() }
         }
     }
@@ -411,12 +346,18 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         save(cfg)
     }
 
+    @objc func setLanguage(_ sender: NSMenuItem) {
+        guard let raw = sender.representedObject as? String, let l = Language(rawValue: raw) else { return }
+        Language.setting = l
+        refreshIcon()
+    }
+
     func save(_ cfg: Config) {
         do {
             try cfg.save()
             repairNow()
         } catch {
-            alert("Impossible d'enregistrer la disposition", error.localizedDescription)
+            alert(t("error.save"), error.localizedDescription)
         }
     }
 
@@ -426,10 +367,10 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let a = NSAlert()
         a.alertStyle = .warning
-        a.messageText = "Désinstaller Display Guard ?"
-        a.informativeText = "Les écrans ne seront plus surveillés. La disposition enregistrée, le journal et l'app partent à la corbeille. Les réglages BetterDisplay restent en place."
-        a.addButton(withTitle: "Désinstaller")
-        a.addButton(withTitle: "Annuler")
+        a.messageText = t("uninstall.title")
+        a.informativeText = t("uninstall.text")
+        a.addButton(withTitle: t("button.uninstall"))
+        a.addButton(withTitle: t("button.cancel"))
         guard a.runModal() == .alertFirstButtonReturn else { return }
 
         // Not booting out our own job: that would kill this process before the cleanup ends.
@@ -444,9 +385,3 @@ final class App: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func quit() { NSApp.terminate(nil) }
 }
-
-let app = NSApplication.shared
-let delegate = App()
-app.delegate = delegate
-app.setActivationPolicy(.accessory)
-app.run()
